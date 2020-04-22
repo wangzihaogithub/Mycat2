@@ -46,7 +46,9 @@ public class ApplicationContext {
     private static final Map<Class,Boolean> FACTORY_METHOD_ANNOTATION_CACHE_MAP = newConcurrentReferenceMap(32);
     private static final Map<Class,PropertyDescriptor[]> PROPERTY_DESCRIPTOR_CACHE_MAP = newConcurrentReferenceMap(128);
     private static final Map<Class,Method[]> DECLARED_METHODS_CACHE_MAP = newConcurrentReferenceMap(128);
+    private static final OrderComparator COMPARATOR = new OrderComparator(new LinkedHashSet<>(Collections.singletonList(Order.class)));
 
+    private BiPredicate<ClassLoader,URL> resourceLoaderUrlFilter = (classLoader, url) -> !isJavaLib(url);
     private Supplier<ClassLoader> resourceLoader;
     private Function<BeanDefinition,String> beanNameGenerator = new DefaultBeanNameGenerator(this);
 
@@ -280,11 +282,14 @@ public class ApplicationContext {
     }
 
     public ScannerResult scanner(ClassLoader classLoader,boolean onlyInMyProject){
-        ScannerResult result = new ScannerResult();
+        return scanner(classLoader,onlyInMyProject,new ScannerResult());
+    }
+
+    public ScannerResult scanner(ClassLoader classLoader,boolean onlyInMyProject,ScannerResult result){
         ClassLoader systemClassLoader = ClassLoader.getSystemClassLoader();
         //只在我的项目中搜索类
         if(onlyInMyProject) {
-            result.classLoaderList.add(classLoader);
+            result.classLoaders.add(classLoader);
             BiConsumer<URL,String> consumer = newScannerConsumer(classLoader,result);
             try {
                 for (String rootPackage : scanner.getRootPackages()) {
@@ -305,12 +310,13 @@ public class ApplicationContext {
             if(urls == null) {
                 continue;
             }
-            result.classUrls.addAll(Arrays.asList(urls));
-            result.classLoaderList.add(userLoader);
+            for (URL url : urls) {
+                result.addClassUrl(userLoader,url);
+            }
         }
 
         //扫描所有用户自定义加载器jar包路径
-        for (URL url : result.classUrls) {
+        for (URL url : result.tempUrls) {
             BiConsumer<URL,String> consumer = newScannerConsumer(classLoader,result);
             try {
                 for(String rootPackage : scanner.getRootPackages()) {
@@ -320,26 +326,65 @@ public class ApplicationContext {
                 throw new IllegalStateException("scanner userClassLoader error. url="+url+",error="+e,e);
             }
         }
+        result.tempUrls.clear();
 
         //扫描系统类加载器的jar包路径
-        if(systemClassLoader instanceof URLClassLoader){
-            URL[] urls = ((URLClassLoader) systemClassLoader).getURLs();
-            if (urls != null) {
-                result.classUrls.addAll(Arrays.asList(urls));
-                result.classLoaderList.add(systemClassLoader);
+        String cp = System.getProperty("java.class.path");
+        if (cp != null) {
+            while (cp.length() > 0) {
+                int pathSepIdx = cp.indexOf(File.pathSeparatorChar);
+                String pathElem;
+                if (pathSepIdx < 0) {
+                    pathElem = cp;
+                    addClassURL(result,systemClassLoader,pathElem);
+                    break;
+                } else if (pathSepIdx > 0) {
+                    pathElem = cp.substring(0, pathSepIdx);
+                    addClassURL(result,systemClassLoader,pathElem);
+                }
+                cp = cp.substring(pathSepIdx + 1);
+            }
+            for (URL url : result.tempUrls) {
                 BiConsumer<URL,String> consumer = newScannerConsumer(systemClassLoader,result);
-                for (URL url : urls) {
-                    try {
-                        for(String rootPackage : scanner.getRootPackages()) {
-                            scanner.doScan(rootPackage, null, url, consumer);
-                        }
-                    }catch (IOException e){
-                        throw new IllegalStateException("scanner systemClassLoader error. url="+url+",error="+e,e);
+                try {
+                    for(String rootPackage : scanner.getRootPackages()) {
+                        scanner.doScan(rootPackage, null, url, consumer);
                     }
+                }catch (IOException e){
+                    throw new IllegalStateException("scanner systemClassLoader error. url="+url+",error="+e,e);
                 }
             }
+            result.tempUrls.clear();
         }
         return result;
+    }
+
+    protected void addClassURL(ScannerResult result, ClassLoader loader, String path){
+        try {
+            URL url = new File(path).getCanonicalFile().toURI().toURL();
+            result.addClassUrl(loader,url);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    public BiPredicate<ClassLoader, URL> getResourceLoaderUrlFilter() {
+        return resourceLoaderUrlFilter;
+    }
+
+    public void setResourceLoaderUrlFilter(BiPredicate<ClassLoader, URL> resourceLoaderUrlFilter) {
+        this.resourceLoaderUrlFilter = resourceLoaderUrlFilter;
+    }
+
+    protected boolean isJavaLib(URL url){
+        String urlStr = url.toString();
+        String[] javaPaths = {"/jre/lib/"};
+        for (String javaPath : javaPaths) {
+            if(urlStr.contains(javaPath)){
+                return true;
+            }
+        }
+        return false;
     }
 
     public ScannerResult scanner(String... rootPackage){
@@ -353,11 +398,32 @@ public class ApplicationContext {
     }
 
     public class ScannerResult{
-        public AtomicInteger classCount = new AtomicInteger();
-        private final List<ClassLoader> classLoaderList = new ArrayList<>();
+        private final AtomicInteger classCount = new AtomicInteger();
+        private final Set<ClassLoader> classLoaders = new LinkedHashSet<>();
+        private final Set<URL> tempUrls = new LinkedHashSet<>();
         private final Set<URL> classUrls = new LinkedHashSet<>();
         private final Map<String,BeanDefinition> beanDefinitionMap = new ConcurrentHashMap<>(64);
         private final Map<Class,Boolean> scannerAnnotationCacheMap = new ConcurrentHashMap<>(64);
+        public int getClassCount() {
+            return classCount.get();
+        }
+        public Set<ClassLoader> getClassLoaders() {
+            return classLoaders;
+        }
+        public Set<URL> getClassUrls() {
+            return classUrls;
+        }
+        public Map<String, BeanDefinition> getBeanDefinitionMap() {
+            return beanDefinitionMap;
+        }
+        public void addClassUrl(ClassLoader loader,URL url){
+            BiPredicate<ClassLoader, URL> filter = getResourceLoaderUrlFilter();
+            if(filter.test(loader,url)){
+                classLoaders.add(loader);
+                classUrls.add(url);
+                tempUrls.add(url);
+            }
+        }
         public int inject(){
             LinkedList<String> beanNameList = new LinkedList<>();
             for (Map.Entry<String,BeanDefinition> entry : beanDefinitionMap.entrySet()) {
@@ -479,7 +545,7 @@ public class ApplicationContext {
             }
         }
         return getBean(beanName,args,required);
-     }
+    }
 
     public <T>T getBean(String beanNameOrAlias,Object[] args,boolean required){
         String beanName = getBeanName(beanNameOrAlias);
@@ -822,7 +888,7 @@ public class ApplicationContext {
             List<String> nameList = new ArrayList<>();
             while (null != entry) {
                 String name = entry.getName();
-                if (name.startsWith(splashedPackageName) && isClassFile(name)) {
+                if (!entry.isDirectory() && name.startsWith(splashedPackageName) && isClassFile(name)) {
                     nameList.add(name);
                 }
                 entry = jarIn.getNextJarEntry();
@@ -976,7 +1042,7 @@ public class ApplicationContext {
             }
         }
 
-        public InjectElement(Field field, ApplicationContext applicationX){
+        public InjectElement(Field field,ApplicationContext applicationX){
             this.member = (T) field;
             this.applicationX = applicationX;
             this.autowiredAnnotation = findDeclaredAnnotation(field, applicationX.autowiredAnnotations, AUTOWIRED_ANNOTATION_CACHE_MAP);
@@ -1022,7 +1088,7 @@ public class ApplicationContext {
             return list;
         }
 
-        public static List<InjectElement<Method>> getInjectMethods(Class rootClass, ApplicationContext applicationX){
+        public static List<InjectElement<Method>> getInjectMethods(Class rootClass,ApplicationContext applicationX){
             List<InjectElement<Method>> result = new ArrayList<>();
             eachClass(rootClass, clazz -> {
                 for (Method method : getDeclaredMethods(clazz)) {
@@ -1931,6 +1997,9 @@ public class ApplicationContext {
         private final Collection<Class<? extends Annotation>> orderedAnnotations;
         public OrderComparator(Collection<Class<? extends Annotation>> orderedAnnotations) {
             this.orderedAnnotations = Objects.requireNonNull(orderedAnnotations);
+        }
+        public Collection<Class<? extends Annotation>> getOrderedAnnotations() {
+            return orderedAnnotations;
         }
         @Override
         public int compare(Object o1, Object o2) {
