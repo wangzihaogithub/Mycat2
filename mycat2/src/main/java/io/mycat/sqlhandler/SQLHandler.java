@@ -21,6 +21,8 @@ public interface SQLHandler<Statement extends SQLStatement> {
     int CODE_400 = 400;//mycat状态码-客户端错误
     int CODE_500 = 500;//mycat状态码-服务端错误
 
+    Class<Statement> getStatementClass();
+
     /**
      * 根据SQL语法树执行具体逻辑
      * @param request 已经分析优化或重写后的SQL语法树

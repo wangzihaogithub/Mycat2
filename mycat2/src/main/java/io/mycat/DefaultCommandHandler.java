@@ -95,6 +95,9 @@ public class DefaultCommandHandler extends AbstractCommandHandler {
                 int code = 0;
                 int executeCount = 0;
                 for (SQLHandler sqlHandler : sqlHandlers) {
+                    if(!sqlHandler.getStatementClass().isInstance(request.getAst())){
+                        continue;
+                    }
                     int returnCode = sqlHandler.execute(request,receiver,session);
                     code |= returnCode;
                     if(code != SQLHandler.CODE_0){

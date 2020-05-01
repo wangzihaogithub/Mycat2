@@ -15,6 +15,11 @@ public abstract class AbstractSQLHandler<Statement extends SQLStatement> impleme
     }
 
     @Override
+    public Class<Statement> getStatementClass() {
+        return statementClass;
+    }
+
+    @Override
     public int execute(SQLRequest<Statement> request, Receiver response, MycatSession session) {
         if(!statementClass.isInstance(request.getAst())){
             return CODE_0;
